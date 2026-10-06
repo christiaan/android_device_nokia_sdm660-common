@@ -64,8 +64,7 @@ $(call soong_config_set_bool,QTI_GPT_UTILS,USE_BSG_FRAMEWORK,false)
 
 # Camera
 PRODUCT_PACKAGES += \
-    android.hardware.camera.provider@2.4-impl \
-    android.hardware.camera.provider@2.4-service \
+    android.hardware.camera.provider-service_32.lineage \
     camera.sdm660:32
 
 # Cgroup and task_profiles
