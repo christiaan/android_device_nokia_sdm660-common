@@ -1,20 +1,28 @@
 /*
  * SPDX-FileCopyrightText: 2015 The CyanogenMod Project
- * SPDX-FileCopyrightText: 2020-2025 The LineageOS Project
+ * SPDX-FileCopyrightText: 2020-2026 The LineageOS Project
  * SPDX-License-Identifier: Apache-2.0
  */
 
 #define LOG_TAG "audio_amplifier"
 //#define LOG_NDEBUG 0
 
+#include <cutils/properties.h>
 #include <cutils/str_parms.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <hardware/audio_amplifier.h>
 #include <hardware/hardware.h>
 #include <log/log.h>
+#include <pthread.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/types.h>
+#include <system/audio.h>
+#include <tinyalsa/asoundlib.h>
+#include <unistd.h>
 
 /* clang-format off */
 #include "platform.h"
@@ -22,6 +30,36 @@
 /* clang-format on */
 
 #define UNUSED __attribute__((unused))
+
+/* Nokia devices: mixer profile, no VI feedback exists */
+#define TFA98XX_NOKIA_MIXER_CARD 0
+#define TFA98XX_NOKIA_MIXER_CTL "speaker Profile"
+
+/* Settle time before a profile switch, from stock audio hal*/
+#define TFA98XX_NOKIA_SWITCH_DELAY_US 20000
+
+/* ro.boot.device from stock audio hal */
+static const char* const nokia_devices[] = {
+        "PL2", "DRG", "B2N", "CTL", "SS2", "SD1", "HH1", "HH6", "HG1",
+};
+/* profiles from stock hal */
+typedef enum {
+    PROFILE_NONE = -1,
+    PROFILE_MUSIC = 0,
+    PROFILE_VOICE,
+    PROFILE_RINGTONE,
+    // PROFILE_SYSTEM_SOUND, not used on stock hal
+    PROFILE_BYPASS,
+    PROFILE_COUNT,
+} tfa_profile_t;
+
+static const char* const tfa_profile_names[PROFILE_COUNT] = {
+        [PROFILE_MUSIC] = "music",
+        [PROFILE_VOICE] = "voice",
+        [PROFILE_RINGTONE] = "ringtone",
+        // [PROFILE_SYSTEM_SOUND] = "system_sound", not used on stock hal
+        [PROFILE_BYPASS] = "bypass",
+};
 
 typedef struct amp_device {
     amplifier_device_t amp_dev;
@@ -35,6 +73,16 @@ typedef struct amp_device {
     typeof(disable_audio_route)* disable_audio_route;
     typeof(platform_get_pcm_device_id)* platform_get_pcm_device_id;
     typeof(get_usecase_from_list)* get_usecase_from_list;
+
+    /* Nokia mixer profile */
+    bool is_fih;
+    pthread_mutex_t lock;
+    struct mixer* mixer;
+    struct mixer_ctl* ctl;
+    bool ctl_absent;
+    audio_mode_t mode;
+    uint32_t out_devices;
+    tfa_profile_t active_profile;
 } tfa_t;
 
 static tfa_t* tfa_dev = NULL;
@@ -56,6 +104,129 @@ static int is_speaker(uint32_t snd_device) {
 
     return speaker;
 }
+
+/* Nokia Amp without feedback start */
+static bool is_fih_device(void) {
+    char board[PROPERTY_VALUE_MAX] = {0};
+    char smartamp[PROPERTY_VALUE_MAX] = {0};
+    bool is_nokia_board = false;
+
+    property_get("ro.boot.device", board, "");
+    for (size_t i = 0; i < sizeof(nokia_devices) / sizeof(nokia_devices[0]); i++) {
+        if (strcmp(board, nokia_devices[i]) == 0) {
+            is_nokia_board = true;
+            break;
+        }
+    }
+
+    if (!is_nokia_board) {
+        return false;
+    }
+
+    property_get("ro.boot.smartamp", smartamp, "nxp");
+    if (strcmp(smartamp, "nxp") == 0) {
+        return true;
+    } else {
+        ALOGI("%s: not a nxp amp (%s)", __func__, smartamp);
+        return false;
+    }
+}
+
+static bool is_speaker_device(uint32_t devices) {
+    return (devices & AUDIO_DEVICE_OUT_SPEAKER) != 0;
+}
+static struct mixer_ctl* tfa98xx_get_ctl(void) {
+    if (tfa_dev->ctl) return tfa_dev->ctl;
+    if (tfa_dev->ctl_absent) return NULL;
+
+    if (!tfa_dev->mixer) {
+        tfa_dev->mixer = mixer_open(TFA98XX_NOKIA_MIXER_CARD);
+        if (!tfa_dev->mixer) {
+            ALOGW("%s: mixer_open(%d) failed", __func__, TFA98XX_NOKIA_MIXER_CARD);
+            return NULL;
+        }
+    }
+
+    tfa_dev->ctl = mixer_get_ctl_by_name(tfa_dev->mixer, TFA98XX_NOKIA_MIXER_CTL);
+    if (!tfa_dev->ctl) {
+        ALOGI("%s: '%s' not present, amplifier disabled", __func__, TFA98XX_NOKIA_MIXER_CTL);
+        tfa_dev->ctl_absent = true;
+        mixer_close(tfa_dev->mixer);
+        tfa_dev->mixer = NULL;
+    }
+    return tfa_dev->ctl;
+}
+
+static void tfa98xx_set_profile(tfa_profile_t profile) {
+    if (profile <= PROFILE_NONE || profile >= PROFILE_COUNT) return;
+    if (tfa_dev->active_profile == profile) return;
+
+    struct mixer_ctl* ctl = tfa98xx_get_ctl();
+    if (!ctl) return;
+
+    usleep(TFA98XX_NOKIA_SWITCH_DELAY_US);
+
+    int rc = mixer_ctl_set_enum_by_string(ctl, tfa_profile_names[profile]);
+    if (rc != 0) {
+        ALOGE("%s: failed to set '%s' to '%s' (%d)", __func__, TFA98XX_NOKIA_MIXER_CTL,
+              tfa_profile_names[profile], rc);
+        return;
+    }
+
+    ALOGI("%s: profile change -- %s", __func__, tfa_profile_names[profile]);
+    tfa_dev->active_profile = profile;
+}
+
+static void tfa98xx_update_route(void) {
+    tfa_profile_t profile;
+    char smartamp[PROPERTY_VALUE_MAX];
+
+    if (!is_speaker_device(tfa_dev->out_devices)) {
+        tfa_dev->active_profile = PROFILE_NONE;
+        return;
+    }
+
+    switch (tfa_dev->mode) {
+        case AUDIO_MODE_IN_CALL:
+        case AUDIO_MODE_IN_COMMUNICATION:
+        case AUDIO_MODE_CALL_SCREEN:
+            profile = PROFILE_VOICE;
+            break;
+        case AUDIO_MODE_RINGTONE:
+            profile = PROFILE_RINGTONE;
+            break;
+        case AUDIO_MODE_NORMAL:
+            property_get("persist.sys.smartamp", smartamp, "1");
+            profile = strcmp(smartamp, "1") == 0 ? PROFILE_MUSIC : PROFILE_BYPASS;
+            break;
+        default:
+            ALOGW("%s: no profile for mode %d, leaving", __func__, tfa_dev->mode);
+            return;
+    }
+
+    tfa98xx_set_profile(profile);
+}
+
+static int amp_set_mode(UNUSED amplifier_device_t* device, audio_mode_t mode) {
+    if (!tfa_dev) return -EINVAL;
+
+    pthread_mutex_lock(&tfa_dev->lock);
+    tfa_dev->mode = mode;
+    tfa98xx_update_route();
+    pthread_mutex_unlock(&tfa_dev->lock);
+    return 0;
+}
+
+static int amp_set_output_devices(UNUSED amplifier_device_t* device, uint32_t devices) {
+    if (!tfa_dev) return -EINVAL;
+
+    pthread_mutex_lock(&tfa_dev->lock);
+    tfa_dev->out_devices = devices;
+    tfa98xx_update_route();
+    pthread_mutex_unlock(&tfa_dev->lock);
+    return 0;
+}
+/* Nokia Amp without feedback end */
 
 static int tfa98xx_start_feedback(void* adev, uint32_t snd_device) {
     tfa_dev->adev = (struct audio_device*)adev;
@@ -161,6 +332,9 @@ static void tfa98xx_stop_feedback(void* adev, uint32_t snd_device) {
 
 static int amp_set_feedback(UNUSED amplifier_device_t* device, void* adev, uint32_t devices,
                             bool enable) {
+    /* Nokia devices don't use VI feedback, stock hal never sets it */
+    if (tfa_dev->is_fih) return 0;
+
     tfa_dev->adev = (struct audio_device*)adev;
     if (enable) {
         tfa98xx_start_feedback(tfa_dev->adev, devices);
@@ -172,7 +346,13 @@ static int amp_set_feedback(UNUSED amplifier_device_t* device, void* adev, uint3
 
 static int amp_dev_close(hw_device_t* device) {
     tfa_t* dev = (tfa_t*)device;
-    if (dev) free(dev);
+    if (dev) {
+        if (dev->is_fih) {
+            if (dev->mixer) mixer_close(dev->mixer);
+            pthread_mutex_destroy(&dev->lock);
+        }
+        free(dev);
+    }
 
     return 0;
 }
@@ -208,6 +388,18 @@ static int amp_module_open(const hw_module_t* module, const char* name, hw_devic
     tfa_dev->amp_dev.out_set_parameters = NULL;
     tfa_dev->amp_dev.in_set_parameters = NULL;
     tfa_dev->amp_dev.set_feedback = amp_set_feedback;
+
+    tfa_dev->is_fih = is_fih_device();
+    if (tfa_dev->is_fih) {
+        pthread_mutex_init(&tfa_dev->lock, NULL);
+        tfa_dev->mode = AUDIO_MODE_NORMAL;
+        tfa_dev->active_profile = PROFILE_NONE;
+        tfa_dev->amp_dev.set_output_devices = amp_set_output_devices;
+        tfa_dev->amp_dev.set_mode = amp_set_mode;
+
+        *device = (hw_device_t*)tfa_dev;
+        return 0;
+    }
 
     if (hw_get_module_by_class(AUDIO_HARDWARE_MODULE_ID, AUDIO_HARDWARE_MODULE_ID_PRIMARY,
                                &tfa_dev->module_ahal)) {
